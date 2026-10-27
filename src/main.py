@@ -5,6 +5,11 @@ contact popup, one results page at a time. Each breeder becomes one dataset
 item with the same columns as the Apps Script tab; export the dataset as CSV
 from the run's Storage tab. Progress is kept in the run's key-value store
 (STATE), so a migrated or resurrected run continues where it stopped.
+
+angus.org rate-limits the contact lookup: after a burst it answers every
+lookup with an empty "Search error". A streak of those is treated as
+throttling, not as breeders without contacts: the actor rewinds, pauses
+(doubling each time) and looks the same breeders up again.
 """
 import asyncio
 import html as htmllib
@@ -20,7 +25,15 @@ ALL_STATES = ('AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI
 BASE = 'https://www.angus.org'
 HEADERS = ['Breeder ID', 'Name', 'Member Code', 'Location', 'State',
            'Contact Details', 'Phones', 'Emails', 'Websites', 'Status', 'Updated']
-MAX_CONSECUTIVE_ERRORS = 3
+# This many empty/failed contact lookups in a row means angus.org is throttling us.
+BLOCK_STREAK = 5
+# Give up (resurrect the run later) after this many pauses without a single real contact.
+MAX_BLOCKS = 6
+MAX_PAUSE_MINUTES = 120
+
+
+class Blocked(Exception):
+    pass
 
 
 def first_url(state):
@@ -137,6 +150,42 @@ def next_state(run):
         run['next_url'] = None
 
 
+async def fetch_contact(session, b, state, tok, url):
+    fragment = await request(session, BASE + '/Account/BreederContact', method='POST',
+        data={'breederId': b['id']},
+        headers={'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                 'X-CSRF-TOKEN-HEADERNAME': tok, 'X-Requested-With': 'XMLHttpRequest',
+                 'Origin': BASE, 'Referer': url})
+    if re.search(r'<!doctype|<html\b|<script\b|<iframe\b|captcha|access denied', fragment, flags=re.I):
+        raise RuntimeError('Unexpected contact response: possible login/security page.')
+    if not fragment.strip() or 'Search error' in fragment:
+        # Either a breeder with no contact on file, or angus.org throttling us. hold() tells them apart.
+        return make_row(b, state, {}, 'OK (no contact)')
+    if not re.search(r'<div\b', fragment, flags=re.I):
+        raise RuntimeError('Contact response format not recognized: ' + repr(fragment[:200]))
+    return make_row(b, state, contact(fragment), 'OK')
+
+
+def hold(run, row, url, current):
+    """Keeps an empty or failed lookup back until the next real contact shows it was genuine."""
+    if not run['pending']:
+        # If this streak turns out to be throttling, the retry restarts from this page.
+        run['retry_from'] = {'next_url': url, 'expected_page': current, 'state_index': run['state_index']}
+    run['pending'].append(row)
+    if len(run['pending']) >= BLOCK_STREAK:
+        raise Blocked('%d empty or failed contact lookups in a row (last: %s)' % (len(run['pending']), row['Status']))
+
+
+async def save_rows(run, done, settings, rows):
+    for row in rows:
+        if row['Phones'] or not settings['only_phones']:
+            await Actor.push_data(row)
+            run['pushed'] += 1
+        if row['Phones']:
+            run['with_phones'] += 1
+        done.add(row['Breeder ID'])
+
+
 async def import_page(session, run, done, settings):
     """Imports one results page. Returns False once maxBreeders is reached."""
     url, state = run['next_url'], run['states'][run['state_index']]
@@ -162,39 +211,20 @@ async def import_page(session, run, done, settings):
             continue
         if settings['max'] and run['pushed'] >= settings['max']:
             return False
+        if settings['target'] and run['with_phones'] >= settings['target']:
+            return False
         await asyncio.sleep(settings['delay'])
         try:
-            fragment = await request(session, BASE + '/Account/BreederContact', method='POST',
-                data={'breederId': b['id']},
-                headers={'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                         'X-CSRF-TOKEN-HEADERNAME': tok, 'X-Requested-With': 'XMLHttpRequest',
-                         'Origin': BASE, 'Referer': url})
-            if re.search(r'<!doctype|<html\b|<script\b|<iframe\b|captcha|access denied', fragment, flags=re.I):
-                raise RuntimeError('Unexpected contact response: possible login/security page.')
-            if not fragment.strip() or 'Search error' in fragment:
-                row = make_row(b, state, {}, 'OK (no contact)')
-            elif not re.search(r'<div\b', fragment, flags=re.I):
-                raise RuntimeError('Contact response format not recognized: ' + repr(fragment[:200]))
-            else:
-                row = make_row(b, state, contact(fragment), 'OK')
+            row = await fetch_contact(session, b, state, tok, url)
         except Exception as e:
             Actor.log.warning('Breeder %s error: %s', b['id'], e)
-            if not run['errors']:
-                # If this streak ends the run, the resumed run restarts from this page.
-                run['retry_from'] = {'next_url': url, 'expected_page': current, 'state_index': run['state_index']}
-            run['errors'].append(make_row(b, state, {}, 'ERROR: %s' % e))
-            if len(run['errors']) >= MAX_CONSECUTIVE_ERRORS:
-                # Stop instead of repeatedly requesting a blocked endpoint. The failed
-                # breeders are not marked done, so a resumed run retries them.
-                raise RuntimeError('%d contact requests failed in a row; stopping. Last error: %s'
-                                   % (len(run['errors']), e))
+            row = make_row(b, state, {}, 'ERROR: %s' % e)
+        if row['Status'] != 'OK':
+            hold(run, row, url, current)
             continue
-        # A success means earlier failures were isolated: record them as ERROR rows.
-        for failed in run['errors'] + [row]:
-            await Actor.push_data(failed)
-            done.add(failed['Breeder ID'])
-            run['pushed'] += 1
-        run['errors'] = []
+        # A real contact means the held rows were genuine: no contact on file, or isolated errors.
+        await save_rows(run, done, settings, run['pending'] + [row])
+        run.update(pending=[], blocks=0)
     if current >= total:
         Actor.log.info('%s: complete (%d pages)', state, total)
         next_state(run)
@@ -218,10 +248,13 @@ async def main():
                 await Actor.fail(status_message='Unknown state code(s): ' + ', '.join(unknown))
                 return
             run = {'states': states, 'state_index': 0, 'next_url': first_url(states[0]),
-                   'expected_page': 1, 'pushed': 0, 'done': [], 'errors': []}
+                   'expected_page': 1, 'pushed': 0, 'with_phones': 0, 'blocks': 0, 'done': [], 'pending': []}
         done = set(run['done'])
-        settings = {'delay': float(actor_input.get('delaySeconds') or 0.75),
-                    'max': int(actor_input.get('maxBreeders') or 0)}
+        settings = {'delay': float(actor_input.get('delaySeconds') or 3),
+                    'pause': float(actor_input.get('blockPauseMinutes') or 15),
+                    'max': int(actor_input.get('maxBreeders') or 0),
+                    'target': int(actor_input.get('targetWithPhones') or 0),
+                    'only_phones': bool(actor_input.get('onlyWithPhones'))}
 
         async def persist(*_):
             run['done'] = list(done)
@@ -230,24 +263,45 @@ async def main():
         Actor.on(Event.PERSIST_STATE, persist)
         async with AsyncSession() as session:
             try:
-                while run['next_url']:
-                    await Actor.set_status_message('%s: page %d (%d breeders so far)' % (
-                        run['states'][run['state_index']], run['expected_page'], run['pushed']))
-                    keep_going = await import_page(session, run, done, settings)
+                while run['next_url'] or (run['pending'] and not run.get('rechecked')):
+                    if not run['next_url']:
+                        # The run ended on a short streak of empty lookups, too short to tell genuine
+                        # "no contact" from throttling. Wait once and look them up again.
+                        run.update(run['retry_from'], pending=[], rechecked=True)
+                        await persist()
+                        Actor.log.info('Re-checking the last empty lookups in %.0f min.', settings['pause'])
+                        await asyncio.sleep(settings['pause'] * 60)
+                        continue
+                    await Actor.set_status_message('%s: page %d (%d breeders, %d with phones)' % (
+                        run['states'][run['state_index']], run['expected_page'], run['pushed'], run['with_phones']))
+                    try:
+                        keep_going = await import_page(session, run, done, settings)
+                    except Blocked as e:
+                        # Throttled: forget the held rows, rewind to where the streak began and wait.
+                        run.update(run['retry_from'], pending=[])
+                        run['blocks'] += 1
+                        if run['blocks'] > MAX_BLOCKS:
+                            raise RuntimeError('still throttled after %d pauses' % MAX_BLOCKS)
+                        pause = min(settings['pause'] * 2 ** (run['blocks'] - 1), MAX_PAUSE_MINUTES)
+                        await persist()
+                        Actor.log.warning('Throttled: %s. Pausing %.0f min (pause %d of %d).', e, pause, run['blocks'], MAX_BLOCKS)
+                        await Actor.set_status_message('Throttled by angus.org; pausing %.0f min (pause %d of %d), %d with phones so far' % (
+                            pause, run['blocks'], MAX_BLOCKS, run['with_phones']))
+                        await asyncio.sleep(pause * 60)
+                        continue
                     await persist()
                     if not keep_going:
-                        await Actor.exit(status_message='Reached maxBreeders (%d).' % settings['max'])
+                        await Actor.exit(status_message='Reached limit: %d breeders, %d with phones.' % (
+                            run['pushed'], run['with_phones']))
                         return
             except Exception as e:
-                if run['errors']:
-                    run.update(run['retry_from'], errors=[])
+                if run['pending']:
+                    run.update(run['retry_from'], pending=[])
                 await persist()
-                await Actor.fail(status_message='Stopped: %s' % e)
+                await Actor.fail(status_message='Stopped: %s. Resurrect this run to continue.' % e)
                 return
-        for failed in run['errors']:
-            await Actor.push_data(failed)
-            done.add(failed['Breeder ID'])
-            run['pushed'] += 1
-        run['errors'] = []
+        await save_rows(run, done, settings, run['pending'])
+        run['pending'] = []
         await persist()
-        await Actor.exit(status_message='Complete: %d breeders from %s' % (run['pushed'], ', '.join(run['states'])))
+        await Actor.exit(status_message='Complete: %d breeders (%d with phones) from %s' % (
+            run['pushed'], run['with_phones'], ', '.join(run['states'])))

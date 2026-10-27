@@ -11,17 +11,38 @@
       "prefill": ["NE"],
       "default": []
     },
+    "targetWithPhones": {
+      "title": "Target rows with phones",
+      "type": "integer",
+      "description": "Stop once this many breeders with at least one phone number are saved (0 = no limit).",
+      "prefill": 300,
+      "default": 0,
+      "minimum": 0
+    },
+    "onlyWithPhones": {
+      "title": "Only save rows with phones",
+      "type": "boolean",
+      "description": "Skip breeders whose contact details have no phone number.",
+      "default": false
+    },
     "delaySeconds": {
-      "title": "Delay between contact requests (seconds)",
+      "title": "Delay between contact lookups (seconds)",
       "type": "number",
-      "description": "Pause before each breeder contact request.",
-      "default": 0.75,
+      "description": "Pause before each breeder contact lookup. Slower pacing hits angus.org's rate limit less often.",
+      "default": 3,
       "minimum": 0.3
+    },
+    "blockPauseMinutes": {
+      "title": "Pause when throttled (minutes)",
+      "type": "number",
+      "description": "How long to wait after angus.org starts returning empty lookups. Doubles on each consecutive block, up to 120 minutes.",
+      "default": 15,
+      "minimum": 1
     },
     "maxBreeders": {
       "title": "Max breeders",
       "type": "integer",
-      "description": "Stop after this many breeders (0 = no limit). Useful for test runs.",
+      "description": "Stop after this many breeders are saved (0 = no limit). Useful for test runs.",
       "default": 0,
       "minimum": 0
     }
