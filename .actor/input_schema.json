@@ -1,0 +1,29 @@
+{
+  "title": "Angus Breeder Import",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "states": {
+      "title": "States",
+      "type": "array",
+      "description": "Two-letter state codes to import. Leave empty for all 50 states.",
+      "editor": "stringList",
+      "prefill": ["NE"],
+      "default": []
+    },
+    "delaySeconds": {
+      "title": "Delay between contact requests (seconds)",
+      "type": "number",
+      "description": "Pause before each breeder contact request.",
+      "default": 0.75,
+      "minimum": 0.3
+    },
+    "maxBreeders": {
+      "title": "Max breeders",
+      "type": "integer",
+      "description": "Stop after this many breeders (0 = no limit). Useful for test runs.",
+      "default": 0,
+      "minimum": 0
+    }
+  }
+}

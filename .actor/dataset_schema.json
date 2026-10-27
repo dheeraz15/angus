@@ -1,0 +1,15 @@
+{
+  "actorSpecification": 1,
+  "views": {
+    "overview": {
+      "title": "Breeders",
+      "transformation": {
+        "fields": ["Breeder ID", "Name", "Member Code", "Location", "State",
+          "Contact Details", "Phones", "Emails", "Websites", "Status", "Updated"]
+      },
+      "display": {
+        "component": "table"
+      }
+    }
+  }
+}

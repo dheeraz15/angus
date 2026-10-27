@@ -1,0 +1,13 @@
+{
+  "actorSpecification": 1,
+  "name": "angus-breeder-import",
+  "title": "Angus Breeder Import",
+  "description": "Imports breeder contact details from the angus.org Find a Breeder search, state by state.",
+  "version": "0.1",
+  "buildTag": "latest",
+  "input": "./input_schema.json",
+  "storages": {
+    "dataset": "./dataset_schema.json"
+  },
+  "dockerfile": "../Dockerfile"
+}

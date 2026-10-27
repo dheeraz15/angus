@@ -1,0 +1,2 @@
+apify>=3.4,<4
+curl_cffi>=0.7
