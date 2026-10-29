@@ -8,7 +8,9 @@
       "type": "array",
       "description": "Two-letter state codes to import. Leave empty for all 50 states.",
       "editor": "stringList",
-      "prefill": ["NE"],
+      "prefill": [
+        "NE"
+      ],
       "default": []
     },
     "targetWithPhones": {
@@ -25,6 +27,21 @@
       "description": "Skip breeders whose contact details have no phone number.",
       "default": false
     },
+    "whenThrottled": {
+      "title": "When throttled",
+      "type": "string",
+      "editor": "select",
+      "description": "What to do when angus.org starts refusing contact lookups (after one retry on a fresh session). 'Stop and save progress' ends the run quickly so you don't pay for idle waiting: run it again later, or put it on a schedule (e.g. every 30 minutes), and it continues with new breeders only. 'Wait and retry' pauses inside the run instead.",
+      "enum": [
+        "stop",
+        "wait"
+      ],
+      "enumTitles": [
+        "Stop and save progress (rerun or schedule later)",
+        "Wait and retry inside this run"
+      ],
+      "default": "stop"
+    },
     "delaySeconds": {
       "title": "Delay between contact lookups (seconds)",
       "type": "number",
@@ -35,7 +52,7 @@
     "blockPauseMinutes": {
       "title": "Pause when throttled (minutes)",
       "type": "number",
-      "description": "How long to wait after angus.org starts returning empty lookups. Doubles on each consecutive block, up to 120 minutes.",
+      "description": "Only used when 'When throttled' is 'Wait and retry'. How long to wait after angus.org starts returning empty lookups; doubles on each consecutive block, up to 120 minutes.",
       "default": 15,
       "minimum": 1
     },
@@ -45,6 +62,33 @@
       "description": "Stop after this many breeders are saved (0 = no limit). Useful for test runs.",
       "default": 0,
       "minimum": 0
+    },
+    "excludeDatasetIds": {
+      "title": "Skip breeders from earlier datasets",
+      "type": "array",
+      "editor": "stringList",
+      "description": "Dataset IDs from runs made before this version (e.g. your first Nebraska run). Breeders in them are added to the skip list once; later runs remember them automatically.",
+      "default": []
+    },
+    "resetProgress": {
+      "title": "Start over",
+      "type": "boolean",
+      "description": "Forget which breeders and states earlier runs imported, and import everything again.",
+      "default": false
+    },
+    "allRowsDatasetName": {
+      "title": "Combined dataset name",
+      "type": "string",
+      "editor": "textfield",
+      "description": "Every new row is also added to this named dataset, so all runs end up in one place for export. Leave empty to turn off.",
+      "default": "angus-breeders"
+    },
+    "progressStoreName": {
+      "title": "Progress store name",
+      "type": "string",
+      "editor": "textfield",
+      "description": "Named key-value store that remembers imported breeders between runs. Use a different name to keep a separate list.",
+      "default": "angus-breeder-progress"
     }
   }
 }

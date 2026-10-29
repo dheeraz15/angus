@@ -6,13 +6,19 @@ item with the same columns as the Apps Script tab; export the dataset as CSV
 from the run's Storage tab. Progress is kept in the run's key-value store
 (STATE), so a migrated or resurrected run continues where it stopped.
 
+Breeders already imported are remembered across runs in a named key-value
+store (PROGRESS), so a new run only imports breeders it has not seen, skips
+states it has finished, and adds every new row to one named dataset too.
+
 angus.org rate-limits the contact lookup: after a burst it answers every
 lookup with an empty "Search error". A streak of those is treated as
-throttling, not as breeders without contacts: the actor rewinds, pauses
-(doubling each time) and looks the same breeders up again.
+throttling, not as breeders without contacts: the actor rewinds, tries once
+more on a fresh session, then either stops (rerun or schedule it later) or
+pauses (doubling each time) and looks the same breeders up again.
 """
 import asyncio
 import html as htmllib
+import random
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -30,6 +36,10 @@ BLOCK_STREAK = 5
 # Give up (resurrect the run later) after this many pauses without a single real contact.
 MAX_BLOCKS = 6
 MAX_PAUSE_MINUTES = 120
+# Contact lookups slow down by this factor after each block, up to MAX_SLOWDOWN, and speed back up
+# by SPEEDUP after every CLEAN_STREAK real contacts in a row. The factor carries over to the next run.
+SLOWDOWN, MAX_SLOWDOWN, SPEEDUP, CLEAN_STREAK = 1.5, 4.0, 0.9, 25
+PROGRESS_KEY = 'PROGRESS'
 
 
 class Blocked(Exception):
@@ -142,6 +152,7 @@ def is_empty_search(page):
 
 
 def next_state(run):
+    run.setdefault('completed_states', []).append(run['states'][run['state_index']])
     run['state_index'] += 1
     if run['state_index'] < len(run['states']):
         st = run['states'][run['state_index']]
@@ -180,10 +191,18 @@ async def save_rows(run, done, settings, rows):
     for row in rows:
         if row['Phones'] or not settings['only_phones']:
             await Actor.push_data(row)
+            if settings['all_rows']:
+                await settings['all_rows'].push_data(row)
             run['pushed'] += 1
         if row['Phones']:
             run['with_phones'] += 1
         done.add(row['Breeder ID'])
+        # Rows that errored are not remembered across runs, and their state is not marked finished,
+        # so the next run looks them up again.
+        if row['Status'].startswith('OK'):
+            settings['known'].add(row['Breeder ID'])
+        elif row['State'] not in run.setdefault('retry_states', []):
+            run['retry_states'].append(row['State'])
 
 
 async def import_page(session, run, done, settings):
@@ -207,13 +226,14 @@ async def import_page(session, run, done, settings):
     if not found:
         raise RuntimeError('No breeder IDs found on results page %d' % current)
     for b in found:
-        if b['id'] in done:
+        if b['id'] in done or b['id'] in settings['known']:
             continue
         if settings['max'] and run['pushed'] >= settings['max']:
             return False
         if settings['target'] and run['with_phones'] >= settings['target']:
             return False
-        await asyncio.sleep(settings['delay'])
+        # Jitter the pacing so lookups don't arrive on a fixed beat.
+        await asyncio.sleep(settings['delay'] * run['slowdown'] * random.uniform(0.7, 1.3))
         try:
             row = await fetch_contact(session, b, state, tok, url)
         except Exception as e:
@@ -224,7 +244,10 @@ async def import_page(session, run, done, settings):
             continue
         # A real contact means the held rows were genuine: no contact on file, or isolated errors.
         await save_rows(run, done, settings, run['pending'] + [row])
-        run.update(pending=[], blocks=0)
+        run.update(pending=[], blocks=0, fresh_tried=False)
+        run['clean'] = run.get('clean', 0) + 1
+        if run['clean'] >= CLEAN_STREAK and run['slowdown'] > 1:
+            run.update(clean=0, slowdown=max(1.0, run['slowdown'] * SPEEDUP))
     if current >= total:
         Actor.log.info('%s: complete (%d pages)', state, total)
         next_state(run)
@@ -234,9 +257,26 @@ async def import_page(session, run, done, settings):
     return True
 
 
+async def load_progress(actor_input):
+    """Opens the named store that remembers imported breeders across runs, and seeds it if asked."""
+    store = await Actor.open_key_value_store(name=actor_input.get('progressStoreName') or 'angus-breeder-progress')
+    progress = None if actor_input.get('resetProgress') else await store.get_value(PROGRESS_KEY)
+    progress = progress or {'known': [], 'completed_states': [], 'slowdown': 1.0}
+    known = set(progress['known'])
+    for dataset_id in actor_input.get('excludeDatasetIds') or []:
+        before = len(known)
+        dataset = await Actor.open_dataset(id=dataset_id.strip(), force_cloud=True)
+        async for item in dataset.iterate_items():
+            if item.get('Breeder ID') and str(item.get('Status', '')).startswith('OK'):
+                known.add(str(item['Breeder ID']).lstrip("'"))
+        Actor.log.info('Dataset %s: %d breeders added to the skip list', dataset_id, len(known) - before)
+    return store, progress, known
+
+
 async def main():
     async with Actor:
         actor_input = await Actor.get_input() or {}
+        store, progress, known = await load_progress(actor_input)
         run = await Actor.get_value('STATE')
         if run:
             Actor.log.info('Resuming from saved state: %s page %d',
@@ -247,61 +287,107 @@ async def main():
             if unknown:
                 await Actor.fail(status_message='Unknown state code(s): ' + ', '.join(unknown))
                 return
+            finished = [s for s in states if s in progress['completed_states']]
+            states = [s for s in states if s not in finished]
+            if finished:
+                Actor.log.info('Skipping states finished in earlier runs: %s', ', '.join(finished))
+            Actor.log.info('%d breeders already imported in earlier runs will be skipped', len(known))
+            if not states:
+                await Actor.exit(status_message='Nothing new: every requested state was finished in an earlier run '
+                                                '(set "Start over" to import again).')
+                return
             run = {'states': states, 'state_index': 0, 'next_url': first_url(states[0]),
-                   'expected_page': 1, 'pushed': 0, 'with_phones': 0, 'blocks': 0, 'done': [], 'pending': []}
+                   'expected_page': 1, 'pushed': 0, 'with_phones': 0, 'blocks': 0, 'done': [], 'pending': [],
+                   'slowdown': float(progress.get('slowdown') or 1.0), 'completed_states': []}
+        run.setdefault('slowdown', 1.0)
         done = set(run['done'])
+        all_rows_name = actor_input.get('allRowsDatasetName', 'angus-breeders')
         settings = {'delay': float(actor_input.get('delaySeconds') or 3),
                     'pause': float(actor_input.get('blockPauseMinutes') or 15),
                     'max': int(actor_input.get('maxBreeders') or 0),
                     'target': int(actor_input.get('targetWithPhones') or 0),
-                    'only_phones': bool(actor_input.get('onlyWithPhones'))}
+                    'only_phones': bool(actor_input.get('onlyWithPhones')),
+                    'wait': actor_input.get('whenThrottled', 'stop') == 'wait',
+                    'known': known,
+                    'all_rows': await Actor.open_dataset(name=all_rows_name) if all_rows_name else None}
 
         async def persist(*_):
             run['done'] = list(done)
             await Actor.set_value('STATE', run)
+            completed = set(progress['completed_states']) | set(run['completed_states'])
+            progress.update(known=sorted(known), slowdown=run['slowdown'],
+                            completed_states=sorted(completed - set(run.get('retry_states', []))))
+            await store.set_value(PROGRESS_KEY, progress)
+
+        async def finish(message):
+            await save_rows(run, done, settings, run['pending'])
+            run['pending'] = []
+            await persist()
+            await Actor.exit(status_message=message)
 
         Actor.on(Event.PERSIST_STATE, persist)
-        async with AsyncSession() as session:
-            try:
-                while run['next_url'] or (run['pending'] and not run.get('rechecked')):
-                    if not run['next_url']:
-                        # The run ended on a short streak of empty lookups, too short to tell genuine
-                        # "no contact" from throttling. Wait once and look them up again.
-                        run.update(run['retry_from'], pending=[], rechecked=True)
-                        await persist()
-                        Actor.log.info('Re-checking the last empty lookups in %.0f min.', settings['pause'])
-                        await asyncio.sleep(settings['pause'] * 60)
-                        continue
-                    await Actor.set_status_message('%s: page %d (%d breeders, %d with phones)' % (
-                        run['states'][run['state_index']], run['expected_page'], run['pushed'], run['with_phones']))
-                    try:
-                        keep_going = await import_page(session, run, done, settings)
-                    except Blocked as e:
-                        # Throttled: forget the held rows, rewind to where the streak began and wait.
-                        run.update(run['retry_from'], pending=[])
-                        run['blocks'] += 1
-                        if run['blocks'] > MAX_BLOCKS:
-                            raise RuntimeError('still throttled after %d pauses' % MAX_BLOCKS)
-                        pause = min(settings['pause'] * 2 ** (run['blocks'] - 1), MAX_PAUSE_MINUTES)
-                        await persist()
-                        Actor.log.warning('Throttled: %s. Pausing %.0f min (pause %d of %d).', e, pause, run['blocks'], MAX_BLOCKS)
-                        await Actor.set_status_message('Throttled by angus.org; pausing %.0f min (pause %d of %d), %d with phones so far' % (
-                            pause, run['blocks'], MAX_BLOCKS, run['with_phones']))
-                        await asyncio.sleep(pause * 60)
-                        continue
+        session = AsyncSession()
+        try:
+            while run['next_url'] or (run['pending'] and not run.get('rechecked')):
+                if not run['next_url']:
+                    # The run ended on a short streak of empty lookups, too short to tell genuine
+                    # "no contact" from throttling. Wait once and look them up again.
+                    if not settings['wait']:
+                        # Keep them back: they are not remembered, so the next run looks them up again.
+                        for row in run['pending']:
+                            if row['State'] not in run.setdefault('retry_states', []):
+                                run['retry_states'].append(row['State'])
+                        run['pending'] = []
+                        break
+                    run.update(run['retry_from'], pending=[], rechecked=True)
                     await persist()
-                    if not keep_going:
-                        await Actor.exit(status_message='Reached limit: %d breeders, %d with phones.' % (
+                    Actor.log.info('Re-checking the last empty lookups in %.0f min.', settings['pause'])
+                    await asyncio.sleep(settings['pause'] * 60)
+                    continue
+                await Actor.set_status_message('%s: page %d (%d new breeders, %d with phones)' % (
+                    run['states'][run['state_index']], run['expected_page'], run['pushed'], run['with_phones']))
+                try:
+                    keep_going = await import_page(session, run, done, settings)
+                except Blocked as e:
+                    # Throttled: forget the held rows and rewind to where the streak began.
+                    run.update(run['retry_from'], pending=[], clean=0)
+                    if not run.get('fresh_tried'):
+                        # The limit may be tied to the session's cookies: retry once on a new session.
+                        run['fresh_tried'] = True
+                        await session.close()
+                        session = AsyncSession()
+                        Actor.log.warning('Throttled: %s. Retrying once on a fresh session.', e)
+                        await asyncio.sleep(settings['delay'] * 5)
+                        continue
+                    run['slowdown'] = min(run['slowdown'] * SLOWDOWN, MAX_SLOWDOWN)
+                    if not settings['wait']:
+                        await persist()
+                        await Actor.exit(status_message=(
+                            'Throttled by angus.org after %d new breeders (%d with phones). Progress saved: '
+                            'run again later, or schedule it, to continue with new breeders only.') % (
                             run['pushed'], run['with_phones']))
                         return
-            except Exception as e:
-                if run['pending']:
-                    run.update(run['retry_from'], pending=[])
+                    run['blocks'] += 1
+                    if run['blocks'] > MAX_BLOCKS:
+                        raise RuntimeError('still throttled after %d pauses' % MAX_BLOCKS)
+                    pause = min(settings['pause'] * 2 ** (run['blocks'] - 1), MAX_PAUSE_MINUTES)
+                    await persist()
+                    Actor.log.warning('Throttled: %s. Pausing %.0f min (pause %d of %d).', e, pause, run['blocks'], MAX_BLOCKS)
+                    await Actor.set_status_message('Throttled by angus.org; pausing %.0f min (pause %d of %d), %d with phones so far' % (
+                        pause, run['blocks'], MAX_BLOCKS, run['with_phones']))
+                    await asyncio.sleep(pause * 60)
+                    continue
                 await persist()
-                await Actor.fail(status_message='Stopped: %s. Resurrect this run to continue.' % e)
-                return
-        await save_rows(run, done, settings, run['pending'])
-        run['pending'] = []
-        await persist()
-        await Actor.exit(status_message='Complete: %d breeders (%d with phones) from %s' % (
+                if not keep_going:
+                    await finish('Reached limit: %d new breeders, %d with phones.' % (run['pushed'], run['with_phones']))
+                    return
+        except Exception as e:
+            if run['pending']:
+                run.update(run['retry_from'], pending=[])
+            await persist()
+            await Actor.fail(status_message='Stopped: %s. Run again (or resurrect this run) to continue.' % e)
+            return
+        finally:
+            await session.close()
+        await finish('Complete: %d new breeders (%d with phones) from %s' % (
             run['pushed'], run['with_phones'], ', '.join(run['states'])))
